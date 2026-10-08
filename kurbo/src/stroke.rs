@@ -217,6 +217,8 @@ pub struct StrokeCtx {
     // Precomputation of the join threshold, to optimize per-join logic.
     // If hypot < (hypot + dot) * join_thresh, omit join altogether.
     join_thresh: f64,
+    // The tolerance of the stroke, which its round caps and joins keep too.
+    tolerance: f64,
 }
 
 impl StrokeCtx {
@@ -237,6 +239,13 @@ impl StrokeCtx {
         self.last_pt = Point::default();
         self.last_tan = Vec2::default();
         self.join_thresh = 0.0;
+        self.tolerance = 0.0;
+    }
+
+    /// The tolerance of the arc of a round cap or join on the unit circle, which the half width
+    /// of the stroke scales: the arc keeps the tolerance of the stroke.
+    fn arc_tolerance(&self, style: &Stroke) -> f64 {
+        self.tolerance / (0.5 * style.width)
     }
 }
 
@@ -307,6 +316,7 @@ fn stroke_undashed(
 ) {
     ctx.reset();
     ctx.join_thresh = 2.0 * tolerance / style.width;
+    ctx.tolerance = tolerance;
 
     for el in path {
         let p0 = ctx.last_pt;
@@ -398,8 +408,7 @@ fn extend_reversed(out: &mut BezPath, elements: &[PathEl]) {
 impl StrokeCtx {
     /// Append forward and backward paths to output.
     fn finish(&mut self, style: &Stroke) {
-        // TODO: scale
-        let tolerance = 1e-3;
+        let tolerance = self.arc_tolerance(style);
         if self.forward_path.is_empty() {
             return;
         }
@@ -441,8 +450,7 @@ impl StrokeCtx {
     }
 
     fn do_join(&mut self, style: &Stroke, tan0: Vec2) {
-        // TODO: scale
-        let tolerance = 1e-3;
+        let tolerance = self.arc_tolerance(style);
         let scale = 0.5 * style.width / tan0.hypot();
         let norm = scale * Vec2::new(-tan0.y, tan0.x);
         let p0 = self.last_pt;
@@ -896,8 +904,8 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
 mod tests {
     use super::dash_iter;
     use crate::{
-        BezPath, Cap::Butt, CubicBez, Join::Miter, Line, PathEl, PathSeg, Shape, Stroke,
-        StrokeOpts, dash, segments, stroke,
+        BezPath, Cap::Butt, CubicBez, Join::Miter, Line, ParamCurve, PathEl, PathSeg, Point, Shape,
+        Stroke, StrokeOpts, dash, segments, stroke,
     };
 
     // A degenerate stroke with a cusp at the endpoint.
@@ -1154,6 +1162,51 @@ mod tests {
 
         let non_finite_dash_pattern = Stroke::new(2.0).with_dashes(0.0, [1.0, f64::NAN]);
         assert!(!non_finite_dash_pattern.is_finite());
+    }
+
+    /// The largest distance of a point of each curve of `path` from the circle of `radius` about the
+    /// nearer of `centres`, at 9 parameters of each curve.
+    fn round_error(path: &BezPath, centres: [Point; 2], radius: f64) -> f64 {
+        path.segments()
+            .filter(|segment| matches!(segment, PathSeg::Cubic(_) | PathSeg::Quad(_)))
+            .flat_map(|segment| (1..10).map(move |step| segment.eval(f64::from(step) / 10.0)))
+            .map(|point| {
+                let distance = centres
+                    .iter()
+                    .map(|centre| (point - *centre).hypot())
+                    .fold(f64::INFINITY, f64::min);
+                (distance - radius).abs()
+            })
+            .fold(0.0, f64::max)
+    }
+
+    /// The round caps and joins of a stroke stay within the tolerance of the stroke, at any width.
+    #[test]
+    fn round_caps_and_joins_take_the_tolerance_of_the_stroke() {
+        let tolerance = 1e-7;
+        let style = Stroke::new(0.01);
+        let caps = stroke(
+            [
+                PathEl::MoveTo((0.0, 0.0).into()),
+                PathEl::LineTo((1.0, 0.0).into()),
+            ],
+            &style,
+            &StrokeOpts::default(),
+            tolerance,
+        );
+        let join = stroke(
+            [
+                PathEl::MoveTo((-1.0, 0.0).into()),
+                PathEl::LineTo((0.0, 0.0).into()),
+                PathEl::LineTo((0.0, -1.0).into()),
+            ],
+            &style.clone().with_caps(Butt),
+            &StrokeOpts::default(),
+            tolerance,
+        );
+
+        assert!(round_error(&caps, [Point::ORIGIN, Point::new(1.0, 0.0)], 0.005) <= tolerance);
+        assert!(round_error(&join, [Point::ORIGIN, Point::ORIGIN], 0.005) <= tolerance);
     }
 
     #[test]
