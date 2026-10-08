@@ -219,6 +219,8 @@ pub struct StrokeCtx {
     join_thresh: f64,
     // The tolerance of the stroke, which its round caps and joins keep too.
     tolerance: f64,
+    // The current subpath has segments, each of them of zero length.
+    degenerate: bool,
 }
 
 impl StrokeCtx {
@@ -240,6 +242,7 @@ impl StrokeCtx {
         self.last_tan = Vec2::default();
         self.join_thresh = 0.0;
         self.tolerance = 0.0;
+        self.degenerate = false;
     }
 
     /// The tolerance of the arc of a round cap or join on the unit circle, which the half width
@@ -323,6 +326,7 @@ fn stroke_undashed(
         match el {
             PathEl::MoveTo(p) => {
                 ctx.finish(style);
+                ctx.degenerate = false;
                 ctx.start_pt = p;
                 ctx.last_pt = p;
             }
@@ -332,6 +336,8 @@ fn stroke_undashed(
                     ctx.do_join(style, tangent);
                     ctx.last_tan = tangent;
                     ctx.do_line(style, tangent, p1);
+                } else {
+                    ctx.degenerate = true;
                 }
             }
             PathEl::QuadTo(p1, p2) => {
@@ -341,6 +347,8 @@ fn stroke_undashed(
                     ctx.do_join(style, tan0);
                     ctx.do_cubic(style, q.raise(), tolerance);
                     ctx.last_tan = tan1;
+                } else {
+                    ctx.degenerate = true;
                 }
             }
             PathEl::CurveTo(p1, p2, p3) => {
@@ -350,6 +358,8 @@ fn stroke_undashed(
                     ctx.do_join(style, tan0);
                     ctx.do_cubic(style, c, tolerance);
                     ctx.last_tan = tan1;
+                } else {
+                    ctx.degenerate = true;
                 }
             }
             PathEl::ClosePath => {
@@ -358,6 +368,8 @@ fn stroke_undashed(
                     ctx.do_join(style, tangent);
                     ctx.last_tan = tangent;
                     ctx.do_line(style, tangent, ctx.start_pt);
+                } else {
+                    ctx.degenerate = true;
                 }
                 ctx.finish_closed(style);
             }
@@ -408,10 +420,16 @@ fn extend_reversed(out: &mut BezPath, elements: &[PathEl]) {
 impl StrokeCtx {
     /// Append forward and backward paths to output.
     fn finish(&mut self, style: &Stroke) {
-        let tolerance = self.arc_tolerance(style);
         if self.forward_path.is_empty() {
-            return;
+            self.finish_degenerate(style);
+        } else {
+            self.write_outline(style);
         }
+    }
+
+    /// Append the forward path, the end cap, the backward path and the start cap to output.
+    fn write_outline(&mut self, style: &Stroke) {
+        let tolerance = self.arc_tolerance(style);
         self.output.extend(&self.forward_path);
         let back_els = self.backward_path.elements();
         let return_p = back_els[back_els.len() - 1].end_point().unwrap();
@@ -432,9 +450,32 @@ impl StrokeCtx {
         self.backward_path.truncate(0);
     }
 
+    /// Paint a degenerate subpath: a circle centred at its point with round caps, else nothing,
+    /// since the orientation of its caps is indeterminate (ISO 32000-2 8.5.3.2).
+    fn finish_degenerate(&mut self, style: &Stroke) {
+        if core::mem::take(&mut self.degenerate)
+            && style.start_cap == Cap::Round
+            && style.end_cap == Cap::Round
+        {
+            self.paint_caps(style, self.start_pt, Vec2::new(1.0, 0.0));
+        }
+    }
+
+    /// Paint the start and the end cap of a dash of zero length at `point` along `tangent`.
+    fn paint_caps(&mut self, style: &Stroke, point: Point, tangent: Vec2) {
+        let norm = (0.5 * style.width / tangent.hypot()) * Vec2::new(-tangent.y, tangent.x);
+        self.forward_path.move_to(point - norm);
+        self.backward_path.move_to(point + norm);
+        self.start_pt = point;
+        self.last_pt = point;
+        self.start_norm = norm;
+        self.write_outline(style);
+    }
+
     /// Finish a closed path
     fn finish_closed(&mut self, style: &Stroke) {
         if self.forward_path.is_empty() {
+            self.finish_degenerate(style);
             return;
         }
         self.do_join(style, self.start_tan);
@@ -904,8 +945,8 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
 mod tests {
     use super::dash_iter;
     use crate::{
-        BezPath, Cap::Butt, CubicBez, Join::Miter, Line, ParamCurve, PathEl, PathSeg, Point, Shape,
-        Stroke, StrokeOpts, dash, segments, stroke,
+        BezPath, Cap, Cap::Butt, CubicBez, Join::Miter, Line, ParamCurve, PathEl, PathSeg, Point,
+        Shape, Stroke, StrokeOpts, dash, segments, stroke,
     };
 
     // A degenerate stroke with a cusp at the endpoint.
@@ -1207,6 +1248,36 @@ mod tests {
 
         assert!(round_error(&caps, [Point::ORIGIN, Point::new(1.0, 0.0)], 0.005) <= tolerance);
         assert!(round_error(&join, [Point::ORIGIN, Point::ORIGIN], 0.005) <= tolerance);
+    }
+
+    /// A degenerate subpath paints a circle with round caps, and nothing with butt or square caps
+    /// (ISO 32000-2 8.5.3.2); a single-point open subpath paints nothing.
+    #[test]
+    fn a_degenerate_subpath_paints_a_circle_with_round_caps() {
+        let p = Point::new(3.0, 4.0);
+        let tolerance = 1e-6;
+        let paint = |path: &[PathEl], cap| {
+            stroke(
+                path.iter().copied(),
+                &Stroke::new(2.0).with_caps(cap),
+                &StrokeOpts::default(),
+                tolerance,
+            )
+        };
+        let line = [PathEl::MoveTo(p), PathEl::LineTo(p)];
+        let closed = [PathEl::MoveTo(p), PathEl::ClosePath];
+
+        for path in [&line[..], &closed[..]] {
+            let circle = paint(path, Cap::Round);
+            assert!(
+                (circle.area().abs() - core::f64::consts::PI).abs() < 1e-5,
+                "{path:?}"
+            );
+            assert!(round_error(&circle, [p, p], 1.0) <= tolerance, "{path:?}");
+            assert!(paint(path, Butt).is_empty(), "{path:?}");
+            assert!(paint(path, Cap::Square).is_empty(), "{path:?}");
+        }
+        assert!(paint(&[PathEl::MoveTo(p)], Cap::Round).is_empty());
     }
 
     #[test]
