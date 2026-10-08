@@ -298,7 +298,7 @@ pub fn stroke_with(
     ctx: &mut StrokeCtx,
 ) {
     if style.dash_pattern.is_empty() {
-        stroke_undashed(path, style, tolerance, ctx);
+        stroke_undashed(path.into_iter().map(|el| (el, None)), style, tolerance, ctx);
     } else {
         let dashed = dash_iter(
             path.into_iter(),
@@ -310,9 +310,10 @@ pub fn stroke_with(
     }
 }
 
-/// Version of stroke expansion for styles with no dashes.
+/// Version of stroke expansion for styles with no dashes: each element of `path` with a tangent is
+/// a dash of zero length, which paints its caps along the tangent.
 fn stroke_undashed(
-    path: impl IntoIterator<Item = PathEl>,
+    path: impl IntoIterator<Item = DashEl>,
     style: &Stroke,
     tolerance: f64,
     ctx: &mut StrokeCtx,
@@ -321,8 +322,12 @@ fn stroke_undashed(
     ctx.join_thresh = 2.0 * tolerance / style.width;
     ctx.tolerance = tolerance;
 
-    for el in path {
+    for (el, zero_dash) in path {
         let p0 = ctx.last_pt;
+        if let Some(tangent) = zero_dash {
+            ctx.paint_caps(style, p0, tangent);
+            continue;
+        }
         match el {
             PathEl::MoveTo(p) => {
                 ctx.finish(style);
@@ -656,6 +661,9 @@ impl StrokeCtx {
     }
 }
 
+/// An element of a dashed path, with the tangent of the path when it is a dash of zero length.
+type DashEl = (PathEl, Option<Vec2>);
+
 /// An implementation of dashing as an iterator-to-iterator transformation.
 struct DashIterator<'a, T> {
     inner: T,
@@ -674,7 +682,7 @@ struct DashIterator<'a, T> {
     seg_remaining: f64,
     start_pt: Point,
     last_pt: Point,
-    stash: Vec<PathEl>,
+    stash: Vec<DashEl>,
     stash_ix: usize,
     stable_dash_order: bool,
     needs_moveto: bool,
@@ -689,9 +697,9 @@ enum DashState {
 }
 
 impl<T: Iterator<Item = PathEl>> Iterator for DashIterator<'_, T> {
-    type Item = PathEl;
+    type Item = DashEl;
 
-    fn next(&mut self) -> Option<PathEl> {
+    fn next(&mut self) -> Option<DashEl> {
         loop {
             match self.state {
                 DashState::NeedInput => {
@@ -768,7 +776,7 @@ pub fn dash<'a>(
     dash_offset: f64,
     dashes: &'a [f64],
 ) -> impl Iterator<Item = PathEl> + 'a {
-    dash_iter(inner, dash_offset, dashes, false)
+    dash_iter(inner, dash_offset, dashes, false).map(|(el, _)| el)
 }
 
 fn dash_iter<'a>(
@@ -881,12 +889,12 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
     }
 
     /// Move arc length forward to next event.
-    fn step(&mut self) -> Option<PathEl> {
+    fn step(&mut self) -> Option<DashEl> {
         let mut result = None;
         if self.state == DashState::ToStash && self.needs_moveto {
             self.needs_moveto = false;
             if self.is_active {
-                result = Some(PathEl::MoveTo(self.current_seg.start()));
+                result = Some((PathEl::MoveTo(self.current_seg.start()), None));
             } else {
                 self.state = DashState::Working;
             }
@@ -896,11 +904,12 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
             let t1 = seg.inv_arclen(self.dash_remaining, DASH_ACCURACY);
             if self.is_active {
                 let subseg = seg.subsegment(0.0..t1);
-                result = Some(seg_to_el(&subseg));
+                let zero_dash = (self.dashes[self.dash_ix] == 0.0).then(|| seg.tangents().0);
+                result = Some((seg_to_el(&subseg), zero_dash));
                 self.state = DashState::Working;
             } else {
                 let p = seg.eval(t1);
-                result = Some(PathEl::MoveTo(p));
+                result = Some((PathEl::MoveTo(p), None));
             }
             self.is_active = !self.is_active;
             self.t += t1 * (1.0 - self.t);
@@ -913,7 +922,7 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
         } else {
             if self.is_active {
                 let seg = self.current_seg.subsegment(self.t..1.0);
-                result = Some(seg_to_el(&seg));
+                result = Some((seg_to_el(&seg), None));
             }
             self.dash_remaining -= self.seg_remaining;
             self.get_input();
@@ -924,7 +933,7 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
     fn handle_closepath(&mut self) {
         if self.state == DashState::ToStash {
             // Have looped back without breaking a dash, just play it back
-            self.stash.push(PathEl::ClosePath);
+            self.stash.push((PathEl::ClosePath, None));
         } else if self.is_active && !self.stable_dash_order {
             // connect with path in stash, skip MoveTo.
             self.stash_ix = 1;
@@ -946,7 +955,7 @@ mod tests {
     use super::dash_iter;
     use crate::{
         BezPath, Cap, Cap::Butt, CubicBez, Join::Miter, Line, ParamCurve, PathEl, PathSeg, Point,
-        Shape, Stroke, StrokeOpts, dash, segments, stroke,
+        Shape, Stroke, StrokeOpts, Vec2, dash, segments, stroke,
     };
 
     // A degenerate stroke with a cusp at the endpoint.
@@ -1070,7 +1079,8 @@ mod tests {
             PathSeg::Line(Line::new((13., 0.), (14., 0.))),
             PathSeg::Line(Line::new((19., 0.), (21., 0.))),
         ];
-        let iter = segments(dash_iter(shape.path_elements(0.), 0., &dashes, true));
+        let iter =
+            segments(dash_iter(shape.path_elements(0.), 0., &dashes, true).map(|(el, _)| el));
         assert_eq!(iter.collect::<Vec<PathSeg>>(), expansion);
     }
 
@@ -1088,7 +1098,7 @@ mod tests {
             PathEl::MoveTo((0.0, 4.0).into()),
             PathEl::LineTo((0.0, 0.0).into()),
         ];
-        let iter = dash_iter(shape.path_elements(0.), 0., &dashes, true);
+        let iter = dash_iter(shape.path_elements(0.), 0., &dashes, true).map(|(el, _)| el);
         assert_eq!(iter.collect::<Vec<PathEl>>(), expansion);
     }
 
@@ -1144,7 +1154,7 @@ mod tests {
             PathEl::MoveTo((10., 12.).into()),
             PathEl::LineTo((10., 10.).into()),
         ];
-        let iter = dash_iter(path.into_iter(), 0., &dashes, true);
+        let iter = dash_iter(path.into_iter(), 0., &dashes, true).map(|(el, _)| el);
         assert_eq!(iter.collect::<Vec<PathEl>>(), expansion);
     }
 
@@ -1278,6 +1288,31 @@ mod tests {
             assert!(paint(path, Cap::Square).is_empty(), "{path:?}");
         }
         assert!(paint(&[PathEl::MoveTo(p)], Cap::Round).is_empty());
+    }
+
+    /// A dash of zero length paints its caps along the path (ISO 32000-2 8.5.3.2): a circle with
+    /// round caps, a square along the path with projecting square caps, nothing with butt caps.
+    #[test]
+    fn a_dash_of_zero_length_paints_its_caps_along_the_path() {
+        let paint = |direction: Vec2, cap| {
+            let end = Point::ORIGIN + 9.0 * direction;
+            stroke(
+                [PathEl::MoveTo(Point::ORIGIN), PathEl::LineTo(end)],
+                &Stroke::new(1.0).with_caps(cap).with_dashes(0.0, [0.0, 2.0]),
+                &StrokeOpts::default(),
+                1e-6,
+            )
+        };
+        let diagonal = Vec2::new(1.0, 1.0).normalize();
+
+        let dots = paint(Vec2::new(1.0, 0.0), Cap::Round);
+        assert!((dots.area().abs() - 5.0 * core::f64::consts::PI / 4.0).abs() < 1e-5);
+        let squares = paint(diagonal, Cap::Square);
+        assert!((squares.area().abs() - 5.0).abs() < 1e-9);
+        let bounds = squares.bounding_box();
+        let corner = 0.5 * core::f64::consts::SQRT_2;
+        assert!((bounds.x0 + corner).abs() < 1e-9 && (bounds.y0 + corner).abs() < 1e-9);
+        assert!(paint(Vec2::new(1.0, 0.0), Butt).area().abs() < 1e-12);
     }
 
     #[test]
